@@ -2482,6 +2482,7 @@
                                         <option value="discord">Discord</option>
                                         <option value="gotify">Gotify</option>
                                         <option value="slack">Slack</option>
+                                        <option value="telegram">Telegram</option>
                                         <option value="json">@T["JSON (full event data + snapshots)"]</option>
                                         <option value="custom">@T["Custom"]</option>
                                     </select></div>
@@ -2529,6 +2530,7 @@
                                             <option value="text">@T["Text (template below)"]</option>
                                             <option value="snapshot">@T["Snapshot image (text in headers, the ntfy shape)"]</option>
                                             <option value="multipart">@T["Multipart (template + image files, the Discord shape)"]</option>
+                                            <option value="telegram">@T["Telegram Bot API (GIF, else snapshot, else text)"]</option>
                                         </select></div>
                                     @if (_notif.WebhookBodyMode != "json")
                                     {
@@ -2538,7 +2540,7 @@
                                     <div class="control-row"><span>@T["Extra headers, one per line (Name: value)"]</span></div>
                                     <textarea class="notif-input ai-prompt" rows="3" @bind="WebhookHeadersText"></textarea>
                                     <div class="event-sub email-sub">
-                                        @T["Placeholders for template and header values: {title} {message} {detail} {link} {camera} {labels} {time} {duration} {status} {server}. {message} is the short push text, {detail} the full story, {link} opens the event (needs the server address above)"]
+                                        @T["Placeholders for template and header values: {title} {message} {detail} {link} {gif} {camera} {labels} {time} {duration} {status} {server}. {message} is the short push text, {detail} the full story, {link} opens the event, {gif} downloads its animated GIF (both need the server address above)"]
                                     </div>
                                 }
                                 <div class="control-row">
@@ -2574,6 +2576,30 @@
                                 <div class="notice small">
                                     @T["In memory samples the snapshots from the live stream instead of reading the clip file while it is still being recorded. Recommended when clips are stored on a NAS, where reading a file mid-write can damage it. Recording itself is untouched either way."]
                                 </div>
+                                <div class="control-row">
+                                    <span>@T["Animated GIF of each event"] <span class="new-tag">@T["NEW"]</span></span>
+                                    <button class="chip @(_notif.EventGif ? "" : "chip-off")"
+                                            @onclick="() => _notif.EventGif = !_notif.EventGif">@(_notif.EventGif ? T["on"] : T["off"])</button>
+                                </div>
+                                @if (_notif.EventGif)
+                                {
+                                    <div class="notice small">
+                                        @T["When an event ends, its clip is turned into a GIF (needs ffmpeg; the Docker image ships one). It is kept with the event (GIF button on the events page) and attached to notifications: Telegram gets it as an animation, Discord and email as a file. Long events are sped up to fit the maximum length."]
+                                    </div>
+                                    <div class="control-row"><span>@T["GIF maximum length (seconds, 3–60)"]</span>
+                                        <input class="ret-input" type="number" min="3" max="60" @bind="_notif.GifMaxSeconds" /></div>
+                                    <div class="control-row"><span>@T["GIF width (pixels, 160–1280)"]</span>
+                                        <input class="ret-input" type="number" min="160" max="1280" step="16" @bind="_notif.GifWidth" /></div>
+                                    <div class="control-row"><span>@T["GIF frames per second (2–15)"]</span>
+                                        <input class="ret-input" type="number" min="2" max="15" @bind="_notif.GifFps" /></div>
+                                    <div class="control-row"><span>@T["GIF size limit (MB, 1–49)"]</span>
+                                        <input class="ret-input" type="number" min="1" max="49" @bind="_notif.GifMaxMegabytes" /></div>
+                                    <div class="control-row">
+                                        <span>@T["Send the GIF as a follow-up webhook message when the notification left mid-event"]</span>
+                                        <button class="chip @(_notif.GifFollowUp ? "" : "chip-off")"
+                                                @onclick="() => _notif.GifFollowUp = !_notif.GifFollowUp">@(_notif.GifFollowUp ? T["on"] : T["off"])</button>
+                                    </div>
+                                }
 
                                 <div class="campanel-divider"></div>
                                 <div class="campanel-subtitle">@T["SERVER ALERTS"]</div>
@@ -3604,6 +3630,12 @@
         eventCooldownMinutes = _notif.EventCooldownMinutes,
         eventEmailDelaySeconds = _notif.EventEmailDelaySeconds,
         eventSnapshotMode = _notif.EventSnapshotMode,
+        eventGif = _notif.EventGif,
+        gifMaxSeconds = _notif.GifMaxSeconds,
+        gifWidth = _notif.GifWidth,
+        gifFps = _notif.GifFps,
+        gifMaxMegabytes = _notif.GifMaxMegabytes,
+        gifFollowUp = _notif.GifFollowUp,
         webhookEnabled = _notif.WebhookEnabled,
         webhookUrl = _notif.WebhookUrl,
         webhookInsecureTls = _notif.WebhookInsecureTls,
@@ -3685,6 +3717,12 @@
                 _notif.WebhookBodyTemplate = "{\"text\":\"*{title}*\\n{message}\\n{link}\"}";
                 SetPresetHeaders("Content-Type: application/json");
                 break;
+            case "telegram":
+                _notif.WebhookMethod = "POST";
+                _notif.WebhookBodyMode = "telegram";
+                _notif.WebhookBodyTemplate = "{title}\n{message}\n{link}";
+                SetPresetHeaders();
+                break;
             case "json":
                 _notif.WebhookMethod = "POST";
                 _notif.WebhookBodyMode = "json";
@@ -3703,6 +3741,7 @@
         "discord" => T["Channel settings → Integrations → Webhooks → copy the webhook URL. Snapshots arrive as image attachments."],
         "gotify" => T["Use your server's /message URL with the app token, e.g. https://gotify.example.com/message?token=…"],
         "slack" => T["Create an incoming webhook in Slack and paste its URL. Snapshots are not supported by Slack webhooks."],
+        "telegram" => T["Paste https://api.telegram.org/bot<TOKEN>/sendMessage?chat_id=<CHAT_ID> (token from @BotFather). The event GIF arrives as an animation when enabled below, otherwise the snapshot as a photo. Leave the access token empty."],
         "json" => T["Sends the full event as JSON (snapshots as base64), for Node-RED, n8n, Home Assistant or your own script."],
         _ => null,
     };
@@ -3713,6 +3752,7 @@
         "discord" => "https://discord.com/api/webhooks/…",
         "gotify" => "https://gotify.example.com/message?token=…",
         "slack" => "https://hooks.slack.com/services/…",
+        "telegram" => "https://api.telegram.org/bot123456:ABC…/sendMessage?chat_id=…",
         _ => "https://example.com/hook",
     };
 

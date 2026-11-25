@@ -43,7 +43,21 @@ public sealed class EventEmailer
     // or starve the recording pumps.
     private readonly Dictionary<string, IStreamHub> _hubs = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, MemoryTap> _taps = new();
+    // Event GIFs: one encode per event, shared by everyone who asks for it
+    // (the close hook, a delay-0 notification, the follow-up).
+    private readonly Dictionary<string, Task<byte[]?>> _gifTasks = new();
+    // GIF follow-ups: a notification that left mid-event gets the GIF as a
+    // second webhook message once BOTH the send and the event end happened,
+    // in whichever order they land.
+    private readonly Dictionary<string, FollowUp> _followUps = new();
     private readonly object _gate = new();
+
+    private sealed class FollowUp
+    {
+        public bool Closed, Sent, Done;
+        public AlertChannels Channels;
+        public readonly DateTime CreatedUtc = DateTime.UtcNow;
+    }
 
     public EventEmailer(NotificationStore store, Notifier notifier,
         RecordingSettings settings, EventStore events)
@@ -103,14 +117,23 @@ public sealed class EventEmailer
         try
         {
             DateTime? trigger = null;
+            bool startOwned;
             lock (_gate)
             {
                 if (_trigger.Remove(rec.Id, out var t)) trigger = t;
-                bool startOwned = _deferred.Remove(rec.Id);
+                startOwned = _deferred.Remove(rec.Id);
                 _claimed.Remove(rec.Id);
-                if (startOwned) return;
             }
             var s = _store.Snapshot();
+            if (s.EventGif && !rec.Ongoing)
+            {
+                // Every event gets its GIF (kept with the event, served by the
+                // API) whether or not this camera notifies — started here, so a
+                // notification that wants it later finds the encode under way.
+                _ = GifTask(rec, s, trigger);
+                if (startOwned && s.GifFollowUp) AdvanceFollowUp(rec, s, closed: true);
+            }
+            if (startOwned) return;
             if (!Claim(rec, s, out var stamp, out var prev, out var channels)) { StopTap(rec.Id); return; }
 
             _ = Task.Run(() => GuardedComposeAsync(rec, s, trigger, stamp, prev, channels));
@@ -214,6 +237,11 @@ public sealed class EventEmailer
         double span = Math.Max(1, (end - rec.StartUtc).TotalSeconds - skip);
         var (attachments, why) = await SnapshotsAsync(rec, want, skip, span, s.EventSnapshotMode)
             .ConfigureAwait(false);
+        // A finished event carries its GIF in this one notification; an ongoing
+        // one gets it as a follow-up once it ends (AdvanceFollowUp).
+        byte[]? gif = null;
+        if (s.EventGif && !ongoing)
+            gif = await GifTask(rec, s, trigger).ConfigureAwait(false);
 
         var labels = rec.Labels.Count > 0 ? string.Join(" + ", rec.Labels) : "detection";
         var local = rec.StartUtc.ToLocalTime();
@@ -233,6 +261,11 @@ public sealed class EventEmailer
                 $" {n} of the {want} snapshots asked for are attached (the clip held no more).",
             var n => $" {n} snapshot(s) attached.",
         };
+        if (gif != null)
+        {
+            attachNote += " An animated GIF of the event is attached.";
+            attachments.Add(new EmailAttachment(GifName(rec), EventGif.ContentType, gif));
+        }
         var body = ongoing
             ? $"{Cap(labels)} on {rec.Camera}, {local:yyyy-MM-dd HH:mm:ss} (local server time), " +
               $"still ongoing when this email was sent ({seconds:0} seconds in)." + attachNote +
@@ -241,12 +274,91 @@ public sealed class EventEmailer
               $"about {seconds:0} seconds long." + attachNote +
               " The full clip is in the web UI's events page.";
 
-        return _notifier.Send(new Alert($"event:{rec.Id}", Recovery: false, subject,
+        bool queued = _notifier.Send(new Alert($"event:{rec.Id}", Recovery: false, subject,
             Headline: $"{Cap(labels)} — {rec.Camera}", body, Context: null,
             Attachments: attachments.Count > 0 ? attachments : null,
             Channels: channels,
             Event: new EventInfo(rec.Camera, rec.Labels.ToArray(), rec.StartUtc, seconds, ongoing, rec.Id),
             Brief: $"{Cap(labels)} on {rec.Camera} at {local:HH:mm}"));
+        if (queued && ongoing && s.EventGif && s.GifFollowUp && channels.HasFlag(AlertChannels.Webhook))
+            AdvanceFollowUp(rec, s, sent: true, channels: channels);
+        return queued;
+    }
+
+    // ------------------------------------------------------------------ event GIF
+
+    private static string GifName(EventRecord rec) =>
+        $"{EventStore.SafeName(rec.Camera)}-{rec.StartUtc.ToLocalTime():yyyyMMdd-HHmmss}.gif";
+
+    /// <summary>The event's GIF encode — started on first ask, shared by every
+    /// later one while it runs; afterwards <see cref="EventGif.CreateAsync"/>
+    /// simply reads the stored file. Resolves to null when no GIF can be made.</summary>
+    private Task<byte[]?> GifTask(EventRecord rec, NotificationSettings s, DateTime? trigger)
+    {
+        lock (_gate)
+        {
+            if (_gifTasks.TryGetValue(rec.Id, out var running)) return running;
+            var task = Task.Run(() => EventGif.CreateAsync(_events, rec, s, trigger));
+            _gifTasks[rec.Id] = task;
+            _ = task.ContinueWith(_ => { lock (_gate) _gifTasks.Remove(rec.Id); },
+                CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default);
+            return task;
+        }
+    }
+
+    /// <summary>Records one half of the follow-up condition (the mid-event
+    /// notification was queued / the event ended); when both have happened the
+    /// GIF goes out once. Entries that never complete (cooldown-skipped,
+    /// failed sends) age out.</summary>
+    private void AdvanceFollowUp(EventRecord rec, NotificationSettings s,
+        bool closed = false, bool sent = false, AlertChannels channels = AlertChannels.None)
+    {
+        bool fire = false;
+        AlertChannels ch;
+        lock (_gate)
+        {
+            var cutoff = DateTime.UtcNow - TimeSpan.FromHours(6);
+            foreach (var stale in _followUps.Where(kv => kv.Value.CreatedUtc < cutoff)
+                         .Select(kv => kv.Key).ToList())
+                _followUps.Remove(stale);
+            if (!_followUps.TryGetValue(rec.Id, out var f)) _followUps[rec.Id] = f = new FollowUp();
+            if (closed) f.Closed = true;
+            if (sent) { f.Sent = true; f.Channels = channels; }
+            if (f.Closed && f.Sent && !f.Done) { f.Done = true; fire = true; }
+            ch = f.Channels;
+            if (f.Done) _followUps.Remove(rec.Id);
+        }
+        if (fire) _ = Task.Run(() => SendGifFollowUpAsync(rec, s, ch));
+    }
+
+    /// <summary>The GIF as its own webhook message, after a notification that
+    /// left while the event was still running. Webhook only: an inbox does not
+    /// need a second mail per event.</summary>
+    private async Task SendGifFollowUpAsync(EventRecord rec, NotificationSettings s, AlertChannels channels)
+    {
+        try
+        {
+            var ch = channels & AlertChannels.Webhook;
+            if (ch == AlertChannels.None) return;
+            var gif = await GifTask(rec, s, null).ConfigureAwait(false);
+            if (gif == null) return;
+            var labels = rec.Labels.Count > 0 ? string.Join(" + ", rec.Labels) : "detection";
+            var local = rec.StartUtc.ToLocalTime();
+            var seconds = Math.Max(0, (rec.EndUtc - rec.StartUtc).TotalSeconds);
+            _notifier.Send(new Alert($"event-gif:{rec.Id}", Recovery: false,
+                $"{rec.Camera}: {labels} at {local:HH:mm:ss} (animation)",
+                Headline: $"{Cap(labels)} — {rec.Camera}",
+                $"Animation of the {labels} event on {rec.Camera}, {local:yyyy-MM-dd HH:mm:ss} " +
+                $"(local server time), about {seconds:0} seconds long.",
+                Attachments: new[] { new EmailAttachment(GifName(rec), EventGif.ContentType, gif) },
+                Channels: ch,
+                Event: new EventInfo(rec.Camera, rec.Labels.ToArray(), rec.StartUtc, seconds, false, rec.Id),
+                Brief: $"{Cap(labels)} on {rec.Camera} at {local:HH:mm} ({seconds:0}s, animation)"));
+        }
+        catch (Exception ex)
+        {
+            Log.Warn($"{rec.Camera}: event GIF follow-up skipped: {Log.Flatten(ex)}");
+        }
     }
 
     private static string Cap(string s) =>

@@ -772,6 +772,32 @@ against someone who already has full read access to the server's files (they'd
 have both the key and the ciphertext). That trade-off is unavoidable for any
 self-hosted app that sends its own authenticated email.
 
+### Event GIFs and Telegram
+
+**Server settings → Notifications → Event notification settings → Animated GIF
+of each event** turns every finished event clip into a short GIF (needs ffmpeg;
+the Docker image ships one). The GIF is stored next to the clip as `event.gif`,
+offered by a **GIF** button on the events page, and served at
+`GET /api/events/{id}/gif` (`?dl=1` to download; same auth as `/clip`, including
+RTSP Basic credentials). Long events are sped up to fit the maximum length (12 s
+by default) rather than cut off; if the result is over the size limit, smaller
+sizes and frame rates are tried. Encrypted footage works both ways.
+
+How the GIF reaches you depends on **Send after**:
+- **0 (when the event ends)** — the one notification carries the snapshots and
+  the GIF.
+- **> 0 (mid-event)** — the notification leaves with snapshots as before; when
+  the event ends, the GIF follows as a second webhook message (toggle: *Send the
+  GIF as a follow-up…*). Email does not get the follow-up.
+
+**Telegram preset:** pick *Telegram* under Webhook settings and paste
+`https://api.telegram.org/bot<TOKEN>/sendMessage?chat_id=<CHAT_ID>` (token from
+@BotFather; leave *Access token* empty). The server calls `sendAnimation` when
+the alert carries a GIF, `sendPhoto` for a snapshot, and `sendMessage` for text
+alerts. Other targets: Discord and email get the GIF as a file, the JSON body
+gains `gif` (base64) and `gifUrl`, and templates can use `{gif}` (a download
+link; needs the server address).
+
 ## AI event descriptions — BETA
 
 > ### 📖 Full guide: **[docs/ai-descriptions.md](docs/ai-descriptions.md)**

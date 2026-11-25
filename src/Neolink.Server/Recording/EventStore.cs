@@ -26,6 +26,8 @@ public sealed class EventRecord
     public bool HasCameraClip { get; set; }
     public DateTime? CameraClipStartUtc { get; set; }
     public double? CameraClipSeconds { get; set; }
+    /// <summary>An animated GIF of the event exists (event.gif, notifications → event GIF).</summary>
+    public bool HasGif { get; set; }
     /// <summary>Seconds of video actually in clip.mp4; shorter than the event when the stream died.</summary>
     public double? ClipSeconds { get; set; }
     /// <summary>What an LLM said it saw (AI event descriptions, opt-in) — written

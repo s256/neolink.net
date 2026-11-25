@@ -193,7 +193,7 @@ public sealed class WebApiOptions
 ///   GET/POST .../detectionzone[?type=]      — the camera's watched/ignored cell grid
 ///   GET /api/cameras/{name}/snapshot.jpg     — a current still (server-cached; ?maxAge= seconds)
 ///   GET /api/events[?camera=&amp;reviewed=&amp;limit=] — recorded detection events (when enabled)
-///   GET /api/events/{id}[/clip /thumb /preview] — one event / its artifacts; POST .../review to (un)dismiss
+///   GET /api/events/{id}[/clip /thumb /gif /preview] — one event / its artifacts; POST .../review to (un)dismiss
 ///   (footage URLs — snapshot + event clip/thumb/preview — also take RTSP Basic credentials)
 ///   POST /api/events/delete {ids[],estimate} — bulk delete events + files (admin; ?estimate summarizes)
 ///   GET/POST /api/cameras/{name}/recording  — per-camera recording switches + event-type filter
@@ -300,7 +300,9 @@ public static class WebApi
         bool? WebhookServerAlerts = null, string? PublicUrl = null,
         string? EventSnapshotMode = null,
         bool? OfflineAttachSnapshots = null, int? OfflineSnapshotCount = null,
-        int? OfflineSnapshotLookbackMinutes = null);
+        int? OfflineSnapshotLookbackMinutes = null,
+        bool? EventGif = null, int? GifMaxSeconds = null, int? GifWidth = null, int? GifFps = null,
+        int? GifMaxMegabytes = null, bool? GifFollowUp = null);
     private sealed record EmergencyCameraRequest(bool? Email, bool? Webhook, bool? Siren, bool? Lights);
     /// <summary>Emergency mode: null = unchanged. A camera entry with every field
     /// null still counts as an entry, so clearing an override sends the camera key
@@ -1883,6 +1885,12 @@ public static class WebApi
                     eventCooldownMinutes = s.EventCooldownMinutes,
                     eventEmailDelaySeconds = s.EventEmailDelaySeconds,
                     eventSnapshotMode = s.EventSnapshotMode,
+                    eventGif = s.EventGif,
+                    gifMaxSeconds = s.GifMaxSeconds,
+                    gifWidth = s.GifWidth,
+                    gifFps = s.GifFps,
+                    gifMaxMegabytes = s.GifMaxMegabytes,
+                    gifFollowUp = s.GifFollowUp,
                     webhookEnabled = s.WebhookEnabled,
                     webhookUrl = s.WebhookUrl,
                     webhookInsecureTls = s.WebhookInsecureTls,
@@ -1943,6 +1951,12 @@ public static class WebApi
                     EventEmailDelaySeconds = Math.Clamp(req.EventEmailDelaySeconds ?? cur.EventEmailDelaySeconds, 0, 300),
                     EventSnapshotMode = req.EventSnapshotMode == null ? cur.EventSnapshotMode
                         : req.EventSnapshotMode.Equals("memory", StringComparison.OrdinalIgnoreCase) ? "memory" : "clip",
+                    EventGif = req.EventGif ?? cur.EventGif,
+                    GifMaxSeconds = Math.Clamp(req.GifMaxSeconds ?? cur.GifMaxSeconds, 3, 60),
+                    GifWidth = Math.Clamp(req.GifWidth ?? cur.GifWidth, 160, 1280),
+                    GifFps = Math.Clamp(req.GifFps ?? cur.GifFps, 2, 15),
+                    GifMaxMegabytes = Math.Clamp(req.GifMaxMegabytes ?? cur.GifMaxMegabytes, 1, 49),
+                    GifFollowUp = req.GifFollowUp ?? cur.GifFollowUp,
                     WebhookEnabled = req.WebhookEnabled ?? cur.WebhookEnabled,
                     WebhookUrl = Cap((req.WebhookUrl ?? cur.WebhookUrl).Trim(), 2000),
                     WebhookInsecureTls = req.WebhookInsecureTls ?? cur.WebhookInsecureTls,
@@ -1954,6 +1968,7 @@ public static class WebApi
                         "text" => "text",
                         "snapshot" => "snapshot",
                         "multipart" => "multipart",
+                        "telegram" => "telegram",
                         _ => "json",
                     },
                     WebhookBodyTemplate = req.WebhookBodyTemplate == null ? cur.WebhookBodyTemplate
@@ -4056,6 +4071,7 @@ public static class WebApi
                 hasThumb = r.HasThumb,
                 hasPreview = r.HasPreview,
                 hasCameraClip = r.HasCameraClip,
+                hasGif = r.HasGif,
                 cameraClipStart = r.CameraClipStartUtc,
                 cameraClipSeconds = r.CameraClipSeconds,
                 clipSeconds = r.ClipSeconds,
@@ -4296,6 +4312,25 @@ public static class WebApi
                     return Results.Json(new { error = "no thumbnail for this event" }, statusCode: 404);
                 SetArtifactCaching(ctx, events.Find(id));
                 return Results.Stream(FootageVault.OpenRead(path), "image/jpeg"); // decrypts when encrypted
+            });
+
+            // The event's animated GIF (notifications → event GIF). ?dl=1 downloads it.
+            app.MapGet("/api/events/{id}/gif", (string id, HttpContext ctx) =>
+            {
+                if (EventMediaAuth(ctx, id) is { } denied) return denied;
+                var path = events.ArtifactPath(id, Neolink.Notifications.EventGif.FileName);
+                if (path == null)
+                    return Results.Json(new { error = "no GIF for this event" }, statusCode: 404);
+                var rec = events.Find(id);
+                SetArtifactCaching(ctx, rec);
+                if (ctx.Request.Query["dl"] == "1")
+                {
+                    var name = rec != null
+                        ? $"{Neolink.Recording.EventStore.SafeName(rec.Camera)} {rec.StartUtc.ToLocalTime():yyyy-MM-dd HHmmss}.gif"
+                        : $"{id}.gif";
+                    return Results.Stream(FootageVault.OpenRead(path), "image/gif", fileDownloadName: name);
+                }
+                return Results.Stream(FootageVault.OpenRead(path), "image/gif"); // decrypts when encrypted
             });
 
             // The clip's low-res sub-stream twin, used by the strip's ambient previews.
@@ -5141,12 +5176,13 @@ public static class WebApi
         return null;
     }
 
-    /// <summary>True for /api/events/{id}/clip|thumb|preview — event footage, whose
+    /// <summary>True for /api/events/{id}/clip|thumb|gif|preview — event footage, whose
     /// auth (like snapshots') additionally accepts RTSP Basic credentials.</summary>
     private static bool IsEventMediaPath(PathString path) =>
         path.StartsWithSegments("/api/events")
         && (path.Value!.EndsWith("/clip", StringComparison.OrdinalIgnoreCase)
             || path.Value.EndsWith("/thumb", StringComparison.OrdinalIgnoreCase)
+            || path.Value.EndsWith("/gif", StringComparison.OrdinalIgnoreCase)
             || path.Value.EndsWith("/preview", StringComparison.OrdinalIgnoreCase));
 
     /// <summary>Offers the Basic challenge only where it helps: headerless clients

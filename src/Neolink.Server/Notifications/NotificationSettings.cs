@@ -81,6 +81,31 @@ public sealed class NotificationSettings
     /// a file mid-write can damage it.</summary>
     public string EventSnapshotMode { get; set; } = "clip";
 
+    // Animated GIF of each event, made from the finished clip (needs ffmpeg).
+    /// <summary>Make event.gif for every event when it ends, keep it with the
+    /// event (GET /api/events/{id}/gif) and attach it to event notifications.
+    /// Off by default: it costs one ffmpeg encode per event.</summary>
+    public bool EventGif { get; set; }
+
+    /// <summary>Longest animation, in seconds (3-60). Longer events are sped up
+    /// to fit rather than cut off, so the whole event is always in it.</summary>
+    public int GifMaxSeconds { get; set; } = 12;
+
+    /// <summary>Width in pixels (160-1280); height follows the aspect ratio.</summary>
+    public int GifWidth { get; set; } = 480;
+
+    /// <summary>Frames per second (2-15).</summary>
+    public int GifFps { get; set; } = 8;
+
+    /// <summary>Size budget in MB (1-49; Telegram bots may upload up to 50 MB,
+    /// most mail servers stop at 10-25 MB). Over it, smaller profiles are tried.</summary>
+    public int GifMaxMegabytes { get; set; } = 8;
+
+    /// <summary>When the notification already left mid-event (send delay &gt; 0),
+    /// send the GIF to the webhook as a second message once the event ends.
+    /// With a delay of 0 the one notification carries the GIF itself.</summary>
+    public bool GifFollowUp { get; set; } = true;
+
     // Webhook channel: one HTTP endpoint, shaped by a preset in the UI or the
     // raw knobs below. Independent of the email master switch.
     public bool WebhookEnabled { get; set; }
@@ -96,7 +121,8 @@ public sealed class NotificationSettings
     public string WebhookMethod { get; set; } = "POST";
     /// <summary>"json" (full event + snapshots base64), "text" (rendered
     /// template), "snapshot" (first image as body, text in headers — ntfy),
-    /// "multipart" (payload_json + image files — Discord).</summary>
+    /// "multipart" (payload_json + image files — Discord), "telegram" (Bot API
+    /// sendAnimation/sendPhoto/sendMessage, chosen by what the alert carries).</summary>
     public string WebhookBodyMode { get; set; } = "json";
     /// <summary>Body template for text/multipart modes; blank = mode default.
     /// Placeholders render here and in header values.</summary>
@@ -148,6 +174,12 @@ public sealed class NotificationSettings
         EventCooldownMinutes = EventCooldownMinutes,
         EventEmailDelaySeconds = EventEmailDelaySeconds,
         EventSnapshotMode = EventSnapshotMode,
+        EventGif = EventGif,
+        GifMaxSeconds = GifMaxSeconds,
+        GifWidth = GifWidth,
+        GifFps = GifFps,
+        GifMaxMegabytes = GifMaxMegabytes,
+        GifFollowUp = GifFollowUp,
         WebhookEnabled = WebhookEnabled,
         WebhookUrl = WebhookUrl,
         WebhookInsecureTls = WebhookInsecureTls,

@@ -302,6 +302,12 @@ public sealed class ApiNotifications
     public bool OfflineAttachSnapshots { get; set; }
     public int OfflineSnapshotCount { get; set; } = 3;
     public int OfflineSnapshotLookbackMinutes { get; set; } = 60;
+    public bool EventGif { get; set; }
+    public int GifMaxSeconds { get; set; } = 12;
+    public int GifWidth { get; set; } = 480;
+    public int GifFps { get; set; } = 8;
+    public int GifMaxMegabytes { get; set; } = 8;
+    public bool GifFollowUp { get; set; } = true;
     public List<string> Cameras { get; set; } = new();
 }
 
@@ -525,7 +531,7 @@ public sealed record ApiEvent(string Id, string Camera, DateTime Start, DateTime
     bool HasPreview = false, string? AiDescription = null, string? AiLevel = null,
     bool AiPending = false, List<string>? AiObjects = null,
     bool HasCameraClip = false, DateTime? CameraClipStart = null, double? CameraClipSeconds = null,
-    double? ClipSeconds = null)
+    double? ClipSeconds = null, bool HasGif = false)
 {
     private static readonly (string Label, string Name)[] Known =
     {

@@ -467,6 +467,13 @@
                                 @UiIcon.Render("download", 13) @T["Download"]
                             </a>
                         }
+                        @if (sel.HasGif && !sel.Ongoing)
+                        {
+                            <a class="chip" href="@(Artifact(sel, "gif"))" target="_blank" rel="noopener"
+                               title="@T["Open the event's animated GIF (right-click to save)"]">
+                                @UiIcon.Render("download", 13) GIF
+                            </a>
+                        }
                         <a class="chip ev-golive" href="@LiveHref(sel.Camera)" title="@T.F("Watch {0} live now", sel.Camera)">
                             @UiIcon.Render("activity", 13) @T["Go live"]
                         </a>

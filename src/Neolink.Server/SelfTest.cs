@@ -9150,6 +9150,93 @@ public static class SelfTest
             }
         });
 
+        Test("event GIF: telegram webhook mode picks the Bot API method by attachment", () =>
+        {
+            var gif = new byte[] { (byte)'G', (byte)'I', (byte)'F', (byte)'8', (byte)'9', (byte)'a', 0, 0 };
+            var jpeg = new byte[] { 0xFF, 0xD8, 0xFF, 0xD9 };
+            var ev = new Notifications.EventInfo("Drive_way", new[] { "person" }, DateTime.UtcNow, 12, false, "ev1");
+            var alert = new Notifications.Alert("event:ev1", false, "Drive_way: person", "Person — Drive_way",
+                "body text", Attachments: new[]
+                {
+                    new Notifications.EmailAttachment("Drive_way-1.jpg", "image/jpeg", jpeg),
+                    new Notifications.EmailAttachment("Drive_way.gif", Notifications.EventGif.ContentType, gif),
+                },
+                Channels: Notifications.AlertChannels.Webhook, Event: ev, Brief: "Person on Drive_way at 14:32");
+            var s = new Notifications.NotificationSettings
+            {
+                WebhookUrl = "https://api.telegram.org/bot123:ABC-def/sendMessage?chat_id=-1001",
+                WebhookBodyMode = "telegram",
+                PublicUrl = "https://cams.example.com/",
+                EventGif = true,
+            };
+            static string Body(HttpRequestMessage r) => r.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
+            static bool Part(string body, string name) =>
+                body.Contains($"name={name};") || body.Contains($"name={name}\r") || body.Contains($"name=\"{name}\"");
+
+            using (var r = Notifications.WebhookSender.BuildRequest(s, "tk_ignored", alert, "selftest"))
+            {
+                AssertEq(r.RequestUri!.AbsolutePath, "/bot123:ABC-def/sendAnimation");
+                Assert(r.RequestUri.Query.Contains("chat_id=-1001"), "chat_id stays in the query");
+                var body = Body(r);
+                Assert(Part(body, "animation") && body.Contains("image/gif"), "GIF rides as the animation");
+                Assert(Part(body, "caption") && body.Contains("Person on Drive_way at 14:32"),
+                    "caption carries the push text");
+                Assert(body.Contains("https://cams.example.com/events?event=ev1"), "caption carries the deep link");
+                Assert(!r.Headers.Contains("Authorization"), "no bearer token: the bot token is in the URL");
+            }
+            using (var r = Notifications.WebhookSender.BuildRequest(s, "",
+                       alert with { Attachments = new[] { alert.Attachments![0] } }, "selftest"))
+            {
+                AssertEq(r.RequestUri!.AbsolutePath, "/bot123:ABC-def/sendPhoto");
+                Assert(Part(Body(r), "photo"), "a snapshot-only alert goes out as a photo");
+            }
+            using (var r = Notifications.WebhookSender.BuildRequest(s, "", alert with { Attachments = null }, "selftest"))
+            {
+                AssertEq(r.RequestUri!.AbsolutePath, "/bot123:ABC-def/sendMessage");
+                Assert(Part(Body(r), "text"), "no media: plain sendMessage");
+            }
+            AssertEq(Notifications.WebhookSender.TelegramUrl(
+                "https://api.telegram.org/bot1:x?chat_id=5", "sendPhoto").ToString(),
+                "https://api.telegram.org/bot1:x/sendPhoto?chat_id=5");
+            bool threw = false;
+            try { Notifications.WebhookSender.TelegramUrl("https://example.com/hook", "sendPhoto"); }
+            catch (InvalidOperationException) { threw = true; }
+            Assert(threw, "a non-bot URL is refused with a readable error");
+            threw = false;
+            s.WebhookUrl = "https://api.telegram.org/bot1:x/sendMessage";
+            try { using var _ = Notifications.WebhookSender.BuildRequest(s, "", alert, "selftest"); }
+            catch (InvalidOperationException) { threw = true; }
+            Assert(threw, "a URL without chat_id is refused");
+
+            // json mode: snapshots stay JPEG-only, the GIF gets its own field and link.
+            s.WebhookUrl = "http://127.0.0.1:1/hook";
+            s.WebhookBodyMode = "json";
+            using (var r = Notifications.WebhookSender.BuildRequest(s, "", alert, "selftest"))
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(Body(r));
+                AssertEq(doc.RootElement.GetProperty("snapshots").GetArrayLength(), 1);
+                AssertEq(doc.RootElement.GetProperty("gif").GetString(), Convert.ToBase64String(gif));
+                AssertEq(doc.RootElement.GetProperty("gifUrl").GetString(), "https://cams.example.com/api/events/ev1/gif");
+            }
+            AssertEq(Notifications.WebhookSender.Render("{gif}", alert, "x", gifLink: "u"), "u");
+        });
+
+        Test("event GIF: speed-up, filter graph and size profiles", () =>
+        {
+            AssertEq(Notifications.EventGif.SpeedFactor(8, 12), 1.0);
+            AssertEq(Notifications.EventGif.SpeedFactor(36, 12), 3.0);
+            var p = new Notifications.EventGif.Profile(480, 8, 128);
+            var g = Notifications.EventGif.FilterGraph(4.5, 3, p);
+            Assert(g.StartsWith("[0:v]trim=start=4.5,setpts=(PTS-STARTPTS)/3,fps=8,scale=480:-2"), g);
+            Assert(g.Contains("palettegen=max_colors=128") && g.Contains("paletteuse="), "per-clip palette");
+            Assert(!Notifications.EventGif.FilterGraph(0, 1, p).Contains("trim"), "no pre-roll, no trim");
+            var profiles = Notifications.EventGif.Profiles(480, 8);
+            AssertEq(profiles[0], p);
+            Assert(profiles.Count >= 3 && profiles.Zip(profiles.Skip(1)).All(t => t.Second.Width <= t.First.Width),
+                "fallback profiles only get smaller");
+            Assert(profiles.All(x => x.Width % 2 == 0 && x.Width >= 160), "widths stay even and sane");
+        });
+
         Test("notification settings: Clone copies every property (reflection sweep)", () =>
         {
             // A property added to NotificationSettings but forgotten in Clone
