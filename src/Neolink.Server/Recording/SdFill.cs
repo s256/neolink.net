@@ -94,6 +94,17 @@ public sealed class SdFill
     private readonly CancellationToken _shutdown;
     private readonly Dictionary<string, Cam> _cams = new(StringComparer.OrdinalIgnoreCase);
 
+    // Per-event outcome of the fetch, for whoever waits on the camera's copy (the event
+    // GIF). Created by whichever side gets there first, so hook order does not matter.
+    private readonly Dictionary<string, (TaskCompletionSource<string?> Tcs, DateTime DoneUtc)> _outcomes = new();
+    private static readonly TimeSpan OutcomeKeep = TimeSpan.FromHours(1);
+
+    /// <summary>How long the camera is held awake per renewal while its copy is pending.</summary>
+    private static readonly TimeSpan HoldSpan = TimeSpan.FromMinutes(2);
+    /// <summary>How long a camera that was already parked at the event's end gets to come
+    /// back for the fetch before the normal wait-for-its-next-wake loop takes over.</summary>
+    private static readonly TimeSpan ReconnectFor = TimeSpan.FromSeconds(60);
+
     public SdFill(EventStore store, RecordingSettings settings, CancellationToken shutdown)
     {
         _store = store;
@@ -109,27 +120,75 @@ public sealed class SdFill
     /// <summary>The per-camera switch; off until the camera's Recording tab turns it on.</summary>
     public bool Enabled(string camera) => _settings.Get(camera).SdFill ?? false;
 
-    /// <summary>Detached: the event pump never waits for the card.</summary>
+    /// <summary>Detached: the event pump never waits for the card. The camera is held awake
+    /// from here, so it cannot doze between the event's end and the fetch.</summary>
     public void OnEventClosed(EventRecord rec)
     {
         Cam? cam;
         lock (_cams) _cams.TryGetValue(rec.Camera, out cam);
-        if (cam == null || !Enabled(rec.Camera)) return;
+        if (cam == null) { Complete(rec.Id, "camera copies are not set up for this camera"); return; }
+        if (!Enabled(rec.Camera)) { Complete(rec.Id, "camera copies are off for this camera"); return; }
+        try { cam.Hold?.Invoke(HoldSpan); } catch { /* best effort */ }
         _ = Task.Run(() => RunAsync(cam, rec));
+    }
+
+    /// <summary>Completes when the fetch for this event is over: null when the camera's copy
+    /// (camera.mp4) was saved, otherwise why there is none. Never faults.</summary>
+    public Task<string?> CopyOutcomeAsync(EventRecord rec)
+    {
+        lock (_outcomes) return Outcome(rec.Id).Task;
+    }
+
+    private TaskCompletionSource<string?> Outcome(string id)
+    {
+        // Caller holds _outcomes.
+        var cutoff = DateTime.UtcNow - OutcomeKeep;
+        foreach (var old in _outcomes.Where(kv => kv.Value.Tcs.Task.IsCompleted && kv.Value.DoneUtc < cutoff)
+                     .Select(kv => kv.Key).ToList())
+            _outcomes.Remove(old);
+        if (!_outcomes.TryGetValue(id, out var e))
+            _outcomes[id] = e = (new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously), default);
+        return e.Tcs;
+    }
+
+    private void Complete(string id, string? why)
+    {
+        lock (_outcomes)
+        {
+            var tcs = Outcome(id);
+            if (tcs.TrySetResult(why)) _outcomes[id] = (tcs, DateTime.UtcNow);
+        }
     }
 
     private async Task RunAsync(Cam cam, EventRecord rec)
     {
+        string? outcome = "the fetch ended without a result";
+        try { outcome = await FetchLoopAsync(cam, rec).ConfigureAwait(false); }
+        finally { Complete(rec.Id, outcome); }
+    }
+
+    /// <summary>Null when fetched, otherwise why not (also logged).</summary>
+    private async Task<string?> FetchLoopAsync(Cam cam, EventRecord rec)
+    {
         int misses = 0;
         var deadline = DateTime.UtcNow + Patience;
+        // Right after the event the hold (OnEventClosed) keeps the camera up, or brings a
+        // camera that had already parked straight back; past this window a sleeping camera
+        // is not woken again, its next self-wake is awaited instead.
+        var reconnectUntil = DateTime.UtcNow + ReconnectFor;
         try
         {
             while (!_shutdown.IsCancellationRequested && DateTime.UtcNow < deadline)
             {
-                if (_store.Find(rec.Id) == null) return; // deleted meanwhile
-                // Only while the camera is awake anyway; it is never woken for this.
+                if (_store.Find(rec.Id) == null) return "the event was deleted meanwhile";
                 if (!cam.Control.Online)
                 {
+                    if (DateTime.UtcNow < reconnectUntil)
+                    {
+                        try { cam.Hold?.Invoke(HoldSpan); } catch { }
+                        await Task.Delay(TimeSpan.FromSeconds(5), _shutdown).ConfigureAwait(false);
+                        continue;
+                    }
                     lock (cam) cam.SeenAsleep = true;
                     await Task.Delay(TimeSpan.FromMinutes(1), _shutdown).ConfigureAwait(false);
                     continue;
@@ -139,11 +198,14 @@ public sealed class SdFill
                     await Task.Delay(TimeSpan.FromMinutes(1), _shutdown).ConfigureAwait(false);
                     continue;
                 }
+                // Keep it up while this one waits its turn for the card.
+                try { cam.Hold?.Invoke(HoldSpan); } catch { }
                 string? verdict;
                 await cam.Gate.WaitAsync(_shutdown).ConfigureAwait(false);
                 try
                 {
-                    if (!await CardReadyAsync(cam, rec.Camera, _shutdown).ConfigureAwait(false)) return;
+                    if (!await CardReadyAsync(cam, rec.Camera, _shutdown).ConfigureAwait(false))
+                        return cam.Card.Why.Length > 0 ? cam.Card.Why : "the SD card is not ready";
                     verdict = await TryOnceAsync(cam, rec, _shutdown).ConfigureAwait(false);
                     lock (cam) cam.LastActive = DateTime.UtcNow;
                 }
@@ -156,25 +218,30 @@ public sealed class SdFill
                     verdict = $"retry: {Log.Flatten(ex)}"; // a dropped link or a parked camera: worth another go
                 }
                 finally { cam.Gate.Release(); }
-                if (verdict == null) return; // fetched
+                if (verdict == null) return null; // fetched
                 if (verdict.StartsWith("retry: ", StringComparison.Ordinal))
                 {
                     if (++misses >= 6)
                     {
                         Log.Info($"{rec.Camera}: no camera copy for the event at {rec.StartUtc.ToLocalTime():HH:mm:ss}: {verdict[7..]}");
-                        return;
+                        return verdict[7..];
                     }
                     await Task.Delay(TimeSpan.FromSeconds(20), _shutdown).ConfigureAwait(false);
                     continue;
                 }
                 Log.Info($"{rec.Camera}: no camera copy for the event at {rec.StartUtc.ToLocalTime():HH:mm:ss}: {verdict}");
-                return;
+                return verdict;
             }
+            if (_shutdown.IsCancellationRequested) return "the server is shutting down";
+            Log.Info($"{rec.Camera}: no camera copy for the event at {rec.StartUtc.ToLocalTime():HH:mm:ss}: " +
+                     $"the camera stayed out of reach for {Patience.TotalHours:0} h");
+            return $"the camera stayed out of reach for {Patience.TotalHours:0} h";
         }
-        catch (OperationCanceledException) { }
+        catch (OperationCanceledException) { return "the server is shutting down"; }
         catch (Exception ex)
         {
             Log.Info($"{rec.Camera}: fetching the camera's copy of the event at {rec.StartUtc.ToLocalTime():HH:mm:ss} failed: {Log.Flatten(ex)}");
+            return $"fetching it failed: {Log.Flatten(ex)}";
         }
     }
 
@@ -184,7 +251,7 @@ public sealed class SdFill
         // Card times are camera-local; the server runs in the same zone.
         var startLocal = rec.StartUtc.ToLocalTime();
         var endLocal = rec.EndUtc.ToLocalTime();
-        cam.Hold?.Invoke(TimeSpan.FromMinutes(2)); // the search and transfer must outlive the park timer
+        cam.Hold?.Invoke(HoldSpan); // the search and transfer must outlive the park timer
         var shift = await ClockShiftAsync(cam, rec.Camera, ct).ConfigureAwait(false);
         var list = await cam.Control.GetSdRecordingsAsync(DateOnly.FromDateTime(startLocal - shift), ct).ConfigureAwait(false);
         if (list == null) return "retry: the camera did not answer the SD search";
@@ -197,7 +264,7 @@ public sealed class SdFill
         if (pickEnd > DateTime.Now.AddSeconds(-5)) return "retry: the camera is still writing it";
         if (pick.SizeBytes > MaxBytes) return $"its copy is {pick.SizeBytes / 1024 / 1024} MB, above the {MaxBytes / 1024 / 1024} MB limit";
 
-        cam.Hold?.Invoke(TimeSpan.FromMinutes(2));
+        cam.Hold?.Invoke(HoldSpan);
         var download = await cam.Control.OpenSdRecordingAsync(pick.Name, ct, yield: true).ConfigureAwait(false);
         var spooled = await Web.SdSpool.SpoolAsync(rec.Camera, pick.Name, download, ct).ConfigureAwait(false);
         if (_store.Find(rec.Id) == null) return "the event was deleted meanwhile";

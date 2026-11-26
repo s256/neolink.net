@@ -2584,7 +2584,7 @@
                                 @if (_notif.EventGif)
                                 {
                                     <div class="notice small">
-                                        @T["When an event ends, its clip is turned into a GIF (needs ffmpeg; the Docker image ships one). It is kept with the event (GIF button on the events page) and attached to notifications: Telegram gets it as an animation, Discord and email as a file. Long events are sped up to fit the maximum length."]
+                                        @T["When an event ends, its clip is turned into a GIF (needs ffmpeg; the Docker image ships one). It is kept with the event (GIF button on the events page) and attached to notifications: Telegram gets it as an animation, Discord and email as a file. Long events are sped up to fit the maximum length. Cameras whose SD-card copies are fetched get their GIF from the camera's own recording instead, sent as a webhook follow-up once that copy is in (email-only alerts get no GIF from those cameras)."]
                                     </div>
                                     <div class="control-row"><span>@T["GIF maximum length (seconds, 3–60)"]</span>
                                         <input class="ret-input" type="number" min="3" max="60" @bind="_notif.GifMaxSeconds" /></div>

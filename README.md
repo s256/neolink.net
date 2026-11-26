@@ -783,6 +783,18 @@ RTSP Basic credentials). Long events are sped up to fit the maximum length (12 s
 by default) rather than cut off; if the result is over the size limit, smaller
 sizes and frame rates are tried. Encrypted footage works both ways.
 
+On cameras whose SD-card copies are fetched (battery cameras, camera
+settings → Recording → **Fetch the camera's own copy of each event**), the GIF is made from the camera's own recording
+(`camera.mp4`), never from Neolink's clip. The camera is kept awake right after
+the event so the copy is pulled straight away; a camera that had already dozed
+is asked to reconnect for up to a minute (a little extra battery per event). The
+GIF waits for that copy and arrives as a follow-up webhook message, even with
+**Send after** = 0, so the alert itself is never held up. That needs the webhook
+channel and the follow-up toggle on; email-only alerts get no GIF from these
+cameras (it stays on the events page). Snapshots in the alert still come from
+Neolink's recording. If no copy can be fetched, there is no GIF and the log says
+why.
+
 How the GIF reaches you depends on **Send after**:
 - **0 (when the event ends)** — the one notification carries the snapshots and
   the GIF.

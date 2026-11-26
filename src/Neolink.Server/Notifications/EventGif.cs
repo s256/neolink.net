@@ -80,20 +80,73 @@ public static class EventGif
                "[b][pal]paletteuse=dither=bayer:bayer_scale=4:diff_mode=rectangle";
     }
 
+    /// <summary>What one encode reads: the file in the event folder, how much of its start
+    /// to skip (pre-roll before the detection, minus <see cref="LeadInSeconds"/>) and how
+    /// many seconds of it to show. The camera's SD copy (camera.mp4) is timed from its own
+    /// start, which SdFill has already put on the server's clock.</summary>
+    internal readonly record struct ClipSource(string FileName, double SkipSeconds, double SpanSeconds, bool CameraCopy);
+
+    internal static ClipSource Source(EventRecord rec, DateTime? triggerUtc, bool cameraCopy)
+    {
+        DateTime start;
+        double clipLen;
+        string file;
+        if (cameraCopy)
+        {
+            // Never Neolink's clip here, even when the copy's start time is missing.
+            file = "camera.mp4";
+            start = rec.CameraClipStartUtc ?? rec.StartUtc;
+            clipLen = rec.CameraClipSeconds is double cl && cl > 0
+                ? cl
+                : Math.Max(1, (rec.EndUtc - start).TotalSeconds);
+        }
+        else
+        {
+            file = "clip.mp4";
+            start = rec.StartUtc;
+            clipLen = rec.ClipSeconds is double cl && cl > 0
+                ? cl
+                : Math.Max(1, (rec.EndUtc - rec.StartUtc).TotalSeconds);
+        }
+        double skip = triggerUtc is { } t && t > start
+            ? Math.Max(0, (t - start).TotalSeconds - LeadInSeconds)
+            : 0;
+        if (skip >= clipLen - 0.5) skip = 0; // clip shorter than its pre-roll: keep it all
+        return new ClipSource(file, skip, Math.Max(1, clipLen - skip), cameraCopy);
+    }
+
+    /// <summary>Why a camera-copy GIF cannot be made (null = the copy is there to encode):
+    /// the fetch's own reason, or the record not carrying a saved copy.</summary>
+    internal static string? CopyMissing(string? fetchOutcome, EventRecord rec) =>
+        fetchOutcome ?? (rec.HasCameraClip ? null : "not saved");
+
     /// <summary>Path of the event's GIF if it was already made.</summary>
     public static string? Existing(EventStore events, string eventId) =>
         events.ArtifactPath(eventId, FileName);
 
     /// <summary>Makes (or reuses) the event's GIF and returns its bytes, or null.
     /// <paramref name="triggerUtc"/> is the detection time (pre-roll before it,
-    /// minus a short lead-in, is skipped).</summary>
+    /// minus a short lead-in, is skipped). With <paramref name="cameraCopy"/> set
+    /// (cameras whose SD-card copy is fetched) the GIF waits for that fetch, however
+    /// long it takes, and is made from the camera's copy only: no copy, no GIF.</summary>
     public static async Task<byte[]?> CreateAsync(EventStore events, EventRecord rec,
-        NotificationSettings s, DateTime? triggerUtc)
+        NotificationSettings s, DateTime? triggerUtc, Func<Task<string?>>? cameraCopy = null)
     {
         try
         {
             if (Existing(events, rec.Id) is { } done)
                 return await ReadAsync(done).ConfigureAwait(false);
+            if (cameraCopy != null)
+            {
+                // Outside the encode gate: other cameras' GIFs must not queue behind a
+                // battery camera that is still sending its card copy.
+                if (CopyMissing(await cameraCopy().ConfigureAwait(false), rec) is { } why)
+                {
+                    Log.Info($"{rec.Camera}: no event GIF for the event at {rec.StartUtc.ToLocalTime():HH:mm:ss} — " +
+                             $"it is made from the camera's SD copy, and there is none ({why})");
+                    return null;
+                }
+            }
             if (Media.Ffmpeg.ExePath is not { } ffmpeg)
             {
                 Log.Info($"{rec.Camera}: event GIF skipped — it needs ffmpeg, and none was found " +
@@ -102,27 +155,25 @@ public static class EventGif
             }
             if (rec.Ongoing)
             {
-                Log.Debug($"{rec.Camera}: event GIF requested while the event is ongoing — skipped");
+                Log.Info($"{rec.Camera}: event GIF skipped — it was asked for while the event was still running");
                 return null;
             }
             string dir;
             try { dir = events.EventDir(rec); }
-            catch (KeyNotFoundException) { return null; } // deleted/expired meanwhile
-            var clip = Path.Combine(dir, "clip.mp4");
-            if (!rec.HasClip || !File.Exists(clip))
+            catch (KeyNotFoundException)
             {
-                Log.Info($"{rec.Camera}: event GIF skipped — this event has no saved clip");
+                Log.Info($"{rec.Camera}: event GIF skipped — the event was deleted before it could be made");
                 return null;
             }
-
-            double skip = triggerUtc is { } t && t > rec.StartUtc
-                ? Math.Max(0, (t - rec.StartUtc).TotalSeconds - LeadInSeconds)
-                : 0;
-            double clipLen = rec.ClipSeconds is double cs && cs > 0
-                ? cs
-                : Math.Max(1, (rec.EndUtc - rec.StartUtc).TotalSeconds);
-            if (skip >= clipLen - 0.5) skip = 0; // clip shorter than its pre-roll: keep it all
-            double span = Math.Max(1, clipLen - skip);
+            var src = Source(rec, triggerUtc, cameraCopy != null);
+            var clip = Path.Combine(dir, src.FileName);
+            if ((src.CameraCopy ? !rec.HasCameraClip : !rec.HasClip) || !File.Exists(clip))
+            {
+                Log.Info($"{rec.Camera}: event GIF skipped — this event has no saved " +
+                         (src.CameraCopy ? "camera copy" : "clip"));
+                return null;
+            }
+            double skip = src.SkipSeconds, span = src.SpanSeconds;
             int maxSeconds = Math.Clamp(s.GifMaxSeconds, 3, 60);
             double speed = SpeedFactor(span, maxSeconds);
             long budget = (long)Math.Clamp(s.GifMaxMegabytes, 1, 49) * 1024 * 1024;
@@ -133,7 +184,8 @@ public static class EventGif
                 // Someone else may have made it while this one queued.
                 if (Existing(events, rec.Id) is { } made)
                     return await ReadAsync(made).ConfigureAwait(false);
-                return await EncodeAndStoreAsync(events, ffmpeg, rec, s, clip, dir, skip, span, speed, maxSeconds, budget)
+                return await EncodeAndStoreAsync(events, ffmpeg, rec, s, clip, dir, skip, span, speed, maxSeconds, budget,
+                        src.CameraCopy)
                     .ConfigureAwait(false);
             }
             finally { EncodeGate.Release(); }
@@ -148,7 +200,7 @@ public static class EventGif
 
     private static async Task<byte[]?> EncodeAndStoreAsync(EventStore events, string ffmpeg, EventRecord rec,
         NotificationSettings s, string clip, string dir, double skip, double span, double speed,
-        int maxSeconds, long budget)
+        int maxSeconds, long budget, bool fromCameraCopy)
     {
         var sw = Stopwatch.StartNew();
         byte[]? best = null;
@@ -164,7 +216,12 @@ public static class EventGif
                 Log.Warn($"{rec.Camera}: event GIF encode failed ({Log.Flatten(ex)})");
                 return null; // a broken clip will not get better at a smaller size
             }
-            if (gif.Length < 6) return null;
+            if (gif.Length < 6)
+            {
+                Log.Info($"{rec.Camera}: event GIF skipped — ffmpeg produced no image from the " +
+                         (fromCameraCopy ? "camera's SD copy" : "clip"));
+                return null;
+            }
             best = gif;
             if (gif.Length <= budget) break;
             Log.Debug($"{rec.Camera}: event GIF at {p.Width}px/{p.Fps}fps is " +
@@ -188,6 +245,7 @@ public static class EventGif
             : "";
         Log.Info($"{rec.Camera}: event GIF ready ({best.Length / 1024} KB, " +
                  $"{span:0}s of footage{sped}, " +
+                 (fromCameraCopy ? "from the camera's SD copy, " : "from Neolink's recording, ") +
                  $"{sw.Elapsed.TotalSeconds:0.0}s to encode)");
         return best;
     }

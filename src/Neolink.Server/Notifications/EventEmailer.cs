@@ -73,6 +73,13 @@ public sealed class EventEmailer
     /// suspends the cooldown. Null leaves every decision to the camera settings.</summary>
     public Func<EmergencySettings>? Emergency { get; set; }
 
+    /// <summary>The SD-card copy fetcher, when any camera has one. On a camera whose copies
+    /// are fetched, the event GIF is made from the camera's copy only and waits for it.</summary>
+    public Neolink.Recording.SdFill? CameraCopies { get; set; }
+
+    /// <summary>This camera's GIF comes from its SD copy (and may take a while).</summary>
+    internal bool GifFromCameraCopy(string camera) => CameraCopies?.Enabled(camera) == true;
+
     /// <summary>The camera's record-stream hub, for in-memory snapshot capture.</summary>
     public void RegisterHub(string camera, IStreamHub hub)
     {
@@ -238,10 +245,17 @@ public sealed class EventEmailer
         var (attachments, why) = await SnapshotsAsync(rec, want, skip, span, s.EventSnapshotMode)
             .ConfigureAwait(false);
         // A finished event carries its GIF in this one notification; an ongoing
-        // one gets it as a follow-up once it ends (AdvanceFollowUp).
+        // one gets it as a follow-up once it ends (AdvanceFollowUp). A camera whose
+        // GIF comes from its SD copy never holds the alert for it: the GIF follows.
+        var delivery = Delivery(s, ongoing, GifFromCameraCopy(rec.Camera), channels);
         byte[]? gif = null;
-        if (s.EventGif && !ongoing)
+        if (delivery == GifDelivery.Inline)
             gif = await GifTask(rec, s, trigger).ConfigureAwait(false);
+        else if (delivery == GifDelivery.NotSent)
+            Log.Info($"{rec.Camera}: the event GIF is not sent with this notification — it is made from the " +
+                     "camera's SD copy and goes out only as a follow-up webhook message " +
+                     (s.GifFollowUp ? "(no webhook on this alert)" : "(the GIF follow-up is turned off)") +
+                     "; it stays on the events page");
 
         var labels = rec.Labels.Count > 0 ? string.Join(" + ", rec.Labels) : "detection";
         var local = rec.StartUtc.ToLocalTime();
@@ -280,9 +294,37 @@ public sealed class EventEmailer
             Channels: channels,
             Event: new EventInfo(rec.Camera, rec.Labels.ToArray(), rec.StartUtc, seconds, ongoing, rec.Id),
             Brief: $"{Cap(labels)} on {rec.Camera} at {local:HH:mm}"));
-        if (queued && ongoing && s.EventGif && s.GifFollowUp && channels.HasFlag(AlertChannels.Webhook))
+        if (queued && delivery == GifDelivery.FollowUpAtClose)
             AdvanceFollowUp(rec, s, sent: true, channels: channels);
+        else if (queued && delivery == GifDelivery.FollowUpNow)
+            AdvanceFollowUp(rec, s, closed: true, sent: true, channels: channels);
         return queued;
+    }
+
+    /// <summary>How an event notification carries the GIF.</summary>
+    internal enum GifDelivery
+    {
+        /// <summary>No GIF involved (off, or ongoing without a follow-up).</summary>
+        None,
+        /// <summary>Attached to this notification (finished event, Neolink's clip).</summary>
+        Inline,
+        /// <summary>Follow-up webhook message once the event ends.</summary>
+        FollowUpAtClose,
+        /// <summary>Follow-up webhook message once the GIF exists (SD-copy camera,
+        /// event already over): the alert never waits for the camera's copy.</summary>
+        FollowUpNow,
+        /// <summary>SD-copy camera with no follow-up route (no webhook, or follow-up off).</summary>
+        NotSent,
+    }
+
+    internal static GifDelivery Delivery(NotificationSettings s, bool ongoing, bool fromCameraCopy,
+        AlertChannels channels)
+    {
+        if (!s.EventGif) return GifDelivery.None;
+        bool canFollow = s.GifFollowUp && channels.HasFlag(AlertChannels.Webhook);
+        if (ongoing) return canFollow ? GifDelivery.FollowUpAtClose : GifDelivery.None;
+        if (!fromCameraCopy) return GifDelivery.Inline;
+        return canFollow ? GifDelivery.FollowUpNow : GifDelivery.NotSent;
     }
 
     // ------------------------------------------------------------------ event GIF
@@ -298,7 +340,9 @@ public sealed class EventEmailer
         lock (_gate)
         {
             if (_gifTasks.TryGetValue(rec.Id, out var running)) return running;
-            var task = Task.Run(() => EventGif.CreateAsync(_events, rec, s, trigger));
+            var copies = GifFromCameraCopy(rec.Camera) ? CameraCopies : null;
+            Func<Task<string?>>? waitCopy = copies == null ? null : () => copies.CopyOutcomeAsync(rec);
+            var task = Task.Run(() => EventGif.CreateAsync(_events, rec, s, trigger, waitCopy));
             _gifTasks[rec.Id] = task;
             _ = task.ContinueWith(_ => { lock (_gate) _gifTasks.Remove(rec.Id); },
                 CancellationToken.None, TaskContinuationOptions.None, TaskScheduler.Default);

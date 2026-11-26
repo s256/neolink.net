@@ -9237,6 +9237,170 @@ public static class SelfTest
             Assert(profiles.All(x => x.Width % 2 == 0 && x.Width >= 160), "widths stay even and sane");
         });
 
+        Test("event GIF: source is the camera's SD copy, timed from its own start", () =>
+        {
+            var start = new DateTime(2026, 11, 26, 8, 42, 20, DateTimeKind.Utc);
+            var rec = new Recording.EventRecord
+            {
+                Id = "e", Camera = "frontdoor", StartUtc = start, EndUtc = start.AddSeconds(13),
+                HasClip = true, ClipSeconds = 13,
+                HasCameraClip = true, CameraClipStartUtc = start.AddSeconds(-6), CameraClipSeconds = 30,
+            };
+            var trigger = start.AddSeconds(7);
+            // Camera copy: 13 s from its start to the trigger, minus the 1 s lead-in.
+            var cam = Notifications.EventGif.Source(rec, trigger, cameraCopy: true);
+            AssertEq(cam.FileName, "camera.mp4");
+            Assert(cam.CameraCopy, "camera copy chosen");
+            AssertEq(cam.SkipSeconds, 12.0);
+            AssertEq(cam.SpanSeconds, 18.0);
+            // Neolink's clip (SD copies off): timed from the event start.
+            var own = Notifications.EventGif.Source(rec, trigger, cameraCopy: false);
+            AssertEq(own.FileName, "clip.mp4");
+            Assert(!own.CameraCopy, "own clip chosen");
+            AssertEq(own.SkipSeconds, 6.0);
+            AssertEq(own.SpanSeconds, 7.0);
+            // A camera copy shorter than its pre-roll is kept whole.
+            rec.CameraClipSeconds = 10;
+            var shortCopy = Notifications.EventGif.Source(rec, trigger, cameraCopy: true);
+            AssertEq(shortCopy.SkipSeconds, 0.0);
+            AssertEq(shortCopy.SpanSeconds, 10.0);
+            // No trigger known: nothing skipped.
+            AssertEq(Notifications.EventGif.Source(rec, null, cameraCopy: true).SkipSeconds, 0.0);
+            // Copy start missing: still the camera's file, never Neolink's clip as a stand-in.
+            rec.CameraClipStartUtc = null;
+            var noStart = Notifications.EventGif.Source(rec, trigger, cameraCopy: true);
+            AssertEq(noStart.FileName, "camera.mp4");
+            Assert(noStart.CameraCopy, "still the camera copy");
+            // The guard in front of the encode: the fetch's reason, or no saved copy, stops it.
+            rec.HasCameraClip = true;
+            AssertEq(Notifications.EventGif.CopyMissing(null, rec), null);
+            AssertEq(Notifications.EventGif.CopyMissing("no SD card is mounted", rec), "no SD card is mounted");
+            rec.HasCameraClip = false;
+            AssertEq(Notifications.EventGif.CopyMissing(null, rec), "not saved");
+        });
+
+        Test("event GIF delivery: SD-copy cameras never hold the alert; the GIF follows", () =>
+        {
+            var D = (Notifications.NotificationSettings s, bool ongoing, bool sd, Notifications.AlertChannels ch) =>
+                Notifications.EventEmailer.Delivery(s, ongoing, sd, ch);
+            var on = new Notifications.NotificationSettings { EventGif = true, GifFollowUp = true };
+            var noFollow = new Notifications.NotificationSettings { EventGif = true, GifFollowUp = false };
+            var hook = Notifications.AlertChannels.Webhook;
+            var mail = Notifications.AlertChannels.Email;
+            var E = Notifications.EventEmailer.GifDelivery.None;
+            AssertEq(D(new Notifications.NotificationSettings(), false, true, hook), E);
+            // Neolink's clip: as before (inline when over, follow-up when mid-event).
+            AssertEq(D(on, false, false, hook), Notifications.EventEmailer.GifDelivery.Inline);
+            AssertEq(D(on, false, false, mail), Notifications.EventEmailer.GifDelivery.Inline);
+            AssertEq(D(on, true, false, hook), Notifications.EventEmailer.GifDelivery.FollowUpAtClose);
+            AssertEq(D(on, true, true, hook), Notifications.EventEmailer.GifDelivery.FollowUpAtClose);
+            // SD copy, event over (Send after 0, or an event shorter than the delay): never inline.
+            AssertEq(D(on, false, true, hook), Notifications.EventEmailer.GifDelivery.FollowUpNow);
+            AssertEq(D(on, false, true, hook | mail), Notifications.EventEmailer.GifDelivery.FollowUpNow);
+            AssertEq(D(on, false, true, mail), Notifications.EventEmailer.GifDelivery.NotSent);
+            AssertEq(D(noFollow, false, true, hook), Notifications.EventEmailer.GifDelivery.NotSent);
+        });
+
+        Test("SD copy outcome: completes for unregistered/disabled cameras, either hook order", () =>
+        {
+            var dir = Path.Combine(Path.GetTempPath(), $"neolink-selftest-{Guid.NewGuid():N}");
+            Directory.CreateDirectory(dir);
+            try
+            {
+                var settings = new Recording.RecordingSettings(dir);
+                var store = new Recording.EventStore(Path.Combine(dir, "rec"));
+                var fill = new Recording.SdFill(store, settings, CancellationToken.None);
+                // Waiter first (the GIF asks before SdFill's close hook runs).
+                var a = new Recording.EventRecord { Id = "a", Camera = "nocam" };
+                var waiting = fill.CopyOutcomeAsync(a);
+                Assert(!waiting.IsCompleted, "pending until the close hook decides");
+                fill.OnEventClosed(a);
+                Assert(waiting.IsCompleted && waiting.Result != null, "unregistered camera: a reason, no copy");
+                // Close hook first, waiter after: the finished outcome is still there.
+                var b = new Recording.EventRecord { Id = "b", Camera = "nocam" };
+                fill.OnEventClosed(b);
+                var late = fill.CopyOutcomeAsync(b);
+                Assert(late.IsCompleted && late.Result != null, "outcome kept for a late waiter");
+            }
+            finally { try { Directory.Delete(dir, true); } catch { } }
+        });
+
+        Test("SD-copy GIF: no copy means no GIF, never Neolink's clip as a stand-in", () =>
+        {
+            var dir = Path.Combine(Path.GetTempPath(), $"neolink-selftest-{Guid.NewGuid():N}");
+            Directory.CreateDirectory(dir);
+            try
+            {
+                var settings = new Recording.RecordingSettings(dir);
+                settings.Update("door", events: null, continuous: null, eventTypes: null,
+                    setEventTypes: false, sdFill: true, setSdFill: true);
+                var store = new Recording.EventStore(Path.Combine(dir, "rec"));
+                var fill = new Recording.SdFill(store, settings, CancellationToken.None);
+                int holds = 0;
+                // Online, but reports no SD card: the fill gives up with a reason.
+                fill.Register("door", new StubCameraControl("door"), () => true, _ => Interlocked.Increment(ref holds));
+                var rec = store.Create("door", DateTime.UtcNow.AddSeconds(-13), new[] { "person" });
+                rec.Ongoing = false;
+                rec.EndUtc = DateTime.UtcNow;
+                rec.HasClip = true; // Neolink's own clip exists — it must still not be used
+                File.WriteAllBytes(Path.Combine(store.EventDir(rec), "clip.mp4"), new byte[64]);
+                var outcome = fill.CopyOutcomeAsync(rec);
+                fill.OnEventClosed(rec);
+                Assert(holds >= 1, "the camera is held awake the moment the event closes");
+                Assert(outcome.Wait(TimeSpan.FromSeconds(10)), "the fill finishes");
+                Assert(outcome.Result != null && !rec.HasCameraClip, $"no copy, with a reason ({outcome.Result})");
+                var gif = Notifications.EventGif.CreateAsync(store, rec,
+                        new Notifications.NotificationSettings { EventGif = true }, rec.StartUtc.AddSeconds(5),
+                        () => fill.CopyOutcomeAsync(rec))
+                    .GetAwaiter().GetResult();
+                Assert(gif == null, "no GIF without the camera's copy");
+                Assert(!File.Exists(Path.Combine(store.EventDir(rec), Notifications.EventGif.FileName)),
+                    "nothing encoded from clip.mp4");
+                // The emailer routes this camera's GIF through the copy (and only this one).
+                var protector = new Notifications.SecretProtector(dir);
+                var nstore = new Notifications.NotificationStore(dir, protector);
+                var emailer = new Notifications.EventEmailer(nstore,
+                    new Notifications.Notifier(nstore, "selftest"), settings, store) { CameraCopies = fill };
+                Assert(emailer.GifFromCameraCopy("door"), "SD-copy camera: GIF follows, from the copy");
+                Assert(!emailer.GifFromCameraCopy("other"), "other cameras keep the old path");
+            }
+            finally { try { Directory.Delete(dir, true); } catch { } }
+        });
+
+        Test("SD copy: a camera already parked at event close is reconnected, not left for its next wake", () =>
+        {
+            var dir = Path.Combine(Path.GetTempPath(), $"neolink-selftest-{Guid.NewGuid():N}");
+            Directory.CreateDirectory(dir);
+            using var cts = new CancellationTokenSource();
+            try
+            {
+                var settings = new Recording.RecordingSettings(dir);
+                settings.Update("door", events: null, continuous: null, eventTypes: null,
+                    setEventTypes: false, sdFill: true, setSdFill: true);
+                var store = new Recording.EventStore(Path.Combine(dir, "rec"));
+                var fill = new Recording.SdFill(store, settings, cts.Token);
+                var control = new ParkableCameraControl("door") { IsOnline = false };
+                int holds = 0;
+                // The hold is what reconnects a parked camera; here it brings the link back.
+                fill.Register("door", control, () => true, _ =>
+                {
+                    Interlocked.Increment(ref holds);
+                    control.IsOnline = true;
+                });
+                var rec = store.Create("door", DateTime.UtcNow.AddSeconds(-10), new[] { "person" });
+                rec.Ongoing = false;
+                rec.EndUtc = DateTime.UtcNow;
+                var outcome = fill.CopyOutcomeAsync(rec);
+                fill.OnEventClosed(rec);
+                Assert(holds >= 1 && control.IsOnline, "held (= reconnected) at once");
+                // Back online, the fill goes straight on to the card (the stub reports none)
+                // instead of waiting a minute for a self-wake.
+                Assert(outcome.Wait(TimeSpan.FromSeconds(8)), "the fetch ran right away");
+                Assert(outcome.Result != null, $"reached the card check ({outcome.Result})");
+            }
+            finally { cts.Cancel(); try { Directory.Delete(dir, true); } catch { } }
+        });
+
         Test("notification settings: Clone copies every property (reflection sweep)", () =>
         {
             // A property added to NotificationSettings but forgotten in Clone
@@ -13404,10 +13568,17 @@ public static class SelfTest
         public bool BatteryPowered => battery;
     }
 
+    /// <summary>A camera whose link can be dropped and restored (a parked battery camera).</summary>
+    private sealed class ParkableCameraControl(string name) : StubCameraControl(name)
+    {
+        public volatile bool IsOnline;
+        public override bool Online => IsOnline;
+    }
+
     private class StubCameraControl(string name) : Streaming.ICameraControl
     {
         public string CameraName => name;
-        public bool Online => true;
+        public virtual bool Online => true;
         public bool CanSetStreamSettings => false;
         public Task<IReadOnlyList<Streaming.StreamEncSetting>?> GetStreamSettingsAsync(CancellationToken ct) =>
             Task.FromResult<IReadOnlyList<Streaming.StreamEncSetting>?>(null);

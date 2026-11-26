@@ -734,6 +734,7 @@ foreach (var cam in config.Cameras)
                 recorder.EventStarted += eventEmailer.OnEventStarted;
                 // The camera's own copy of each event from its SD card (battery cameras).
                 sdFill ??= new Neolink.Recording.SdFill(eventStore, recordingSettings, shutdown.Token);
+                eventEmailer.CameraCopies = sdFill; // GIFs of SD-copy cameras come from the camera's copy
                 sdFill.Register(cam.Name, control, () => camServices.Any(s => s.SleepFriendly),
                     span => HoldOne(camServices, span));
                 var emailer = eventEmailer;
